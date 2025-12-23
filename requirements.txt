@@ -1,9 +1,8 @@
 streamlit
 tensorflow-cpu
-librosa>=0.10.0
-numpy<2.0.0
+librosa
+numpy
 scipy
 noisereduce
 soundfile
 matplotlib
-numba>=0.57.0
