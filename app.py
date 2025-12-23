@@ -35,7 +35,7 @@ st.sidebar.info(f"Mevcut Eşik: {THRESHOLD}. Bu değerin altı 'Doğrulandı' ka
 @st.cache_resource
 def load_siamese_model():
     # MODEL YOLUNUZU BURAYA GİRİN
-    model_path = 'model/siamese_model.h5' 
+    model_path = 'model/best_siamese_model.h5' 
     try:
         model = tf.keras.models.load_model(model_path)
         st.sidebar.success("✅ Model başarıyla yüklendi!")
