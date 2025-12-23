@@ -1,8 +1,9 @@
 streamlit
-tensorflow  # veya keras, modelinize bağlı olarak
-librosa
-numpy
+tensorflow-cpu
+librosa>=0.10.0
+numpy<2.0.0
 scipy
 noisereduce
 soundfile
-matplotlib # Spektrogram görselleştirmesi için
+matplotlib
+numba>=0.57.0
