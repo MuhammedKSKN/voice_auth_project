@@ -6,216 +6,247 @@ import noisereduce as nr
 import io
 import soundfile as sf
 import matplotlib.pyplot as plt
+import os
 
-# --- SAYFA AYARLARI ---
-st.set_page_config(
-    page_title="Sesle Kimlik Doğrulama & Deepfake Tespiti",
-    page_icon="🎙️",
-    layout="wide"
-)
+# --- KERAS IMPORTS (Modeli yeniden inşa etmek için) ---
+from tensorflow.keras import layers, models, backend as K
+from tensorflow.keras.regularizers import l2
 
-# --- BAŞLIK VE AÇIKLAMA ---
-st.title("🛡️ Sesle Kimlik Doğrulama ve Deepfake Tespiti")
-st.markdown("""
-Bu uygulama, Siyam Evrişimli Sinir Ağı (Siamese CNN) kullanarak ses tabanlı kimlik doğrulama yapar.
-Sistem, gerçek kullanıcı seslerini deepfake taklitlerinden ve yetkisiz kullanıcılardan ayırt etmek için tasarlanmıştır.
-""")
-st.markdown("---")
+# ============================================================================
+# 1. AYARLAR VE SABİTLER
+# ============================================================================
+st.set_page_config(page_title="Sesle Kimlik Doğrulama", page_icon="🎙️", layout="wide")
 
-# --- KENAR ÇUBUĞU (SIDEBAR) AYARLARI ---
-st.sidebar.header("⚙️ Ayarlar ve Model")
+SR = 16000
+N_MFCC = 40
+HOP_LENGTH = 512
+MAX_LEN = 128  # 4 saniye için CNN giriş boyutu
 
-# 1. Eşik Değeri (Threshold) Ayarı
-# Bu değerin altında kalan mesafeler "Eşleşme", üstünde kalanlar "Eşleşmeme" sayılır.
-# Modelinizi test ederken bu değeri değiştirerek en iyi noktayı bulabilirsiniz.
-THRESHOLD = st.sidebar.slider("Karar Eşik Değeri (Distance Threshold)", 0.0, 2.0, 0.5, 0.01)
-st.sidebar.info(f"Mevcut Eşik: {THRESHOLD}. Bu değerin altı 'Doğrulandı' kabul edilir.")
+# ============================================================================
+# 2. MODEL MİMARİSİ VE YÜKLEME FONKSİYONLARI
+# ============================================================================
 
-# 2. Modeli Yükleme (Önbelleğe alma)
+# --- Özel Fonksiyonlar (Custom Layers/Loss) ---
+def euclidean_distance(vects):
+    x, y = vects
+    sum_square = K.sum(K.square(x - y), axis=1, keepdims=True)
+    return K.sqrt(K.maximum(sum_square, K.epsilon()))
+
+def eucl_dist_output_shape(shapes):
+    shape1, shape2 = shapes
+    return (shape1[0], 1)
+
+def contrastive_loss(y_true, y_pred):
+    margin = 1.0
+    square_pred = K.square(y_pred)
+    margin_square = K.square(K.maximum(margin - y_pred, 0))
+    return K.mean(y_true * square_pred + (1 - y_true) * margin_square)
+
+# --- Temel Ağ (Base Network) ---
+def build_base_network(input_shape):
+    input_layer = layers.Input(shape=input_shape)
+    reg = l2(0.01)
+    
+    x = layers.Conv2D(32, (3, 3), activation='relu', padding='same', kernel_regularizer=reg)(input_layer)
+    x = layers.BatchNormalization()(x)
+    x = layers.MaxPooling2D((2, 2))(x)
+    x = layers.Dropout(0.3)(x)
+    
+    x = layers.Conv2D(64, (3, 3), activation='relu', padding='same', kernel_regularizer=reg)(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.MaxPooling2D((2, 2))(x)
+    x = layers.Dropout(0.4)(x)
+    
+    x = layers.Conv2D(128, (3, 3), activation='relu', padding='same', kernel_regularizer=reg)(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.MaxPooling2D((2, 2))(x)
+    x = layers.Dropout(0.5)(x)
+    
+    x = layers.Flatten()(x)
+    x = layers.Dense(256, activation='relu', kernel_regularizer=reg)(x)
+    x = layers.Dropout(0.5)(x)
+    x = layers.Dense(128, activation=None)(x)
+    
+    # Lambda katmanı (L2 Normalize)
+    x = layers.Lambda(lambda x: K.l2_normalize(x, axis=1))(x)
+    
+    return models.Model(input_layer, x, name="Shared_Encoder")
+
+# --- Modeli Yükleyen Ana Fonksiyon (CACHE ile) ---
 @st.cache_resource
-def load_siamese_model():
-    # MODEL YOLUNUZU BURAYA GİRİN
-    model_path = 'model/best_siamese_model.h5' 
+def load_siamese_model_weights():
+    # 1. Model yolunu bul
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    # GitHub'da 'model' klasörü içindeyse:
+    model_path = os.path.join(current_dir, "model", "siamese_model.h5")
+    
+    # Dosya kontrolü
+    if not os.path.exists(model_path):
+        st.error(f"⚠️ Model dosyası bulunamadı: {model_path}")
+        return None
+
     try:
-        model = tf.keras.models.load_model(model_path)
-        st.sidebar.success("✅ Model başarıyla yüklendi!")
+        # 2. Mimarisi Sıfırdan İnşa Et
+        input_shape_model = (N_MFCC, MAX_LEN, 1)
+        base_network = build_base_network(input_shape_model)
+
+        input_a = layers.Input(shape=input_shape_model, name="Left_Audio")
+        input_b = layers.Input(shape=input_shape_model, name="Right_Audio")
+
+        processed_a = base_network(input_a)
+        processed_b = base_network(input_b)
+
+        distance = layers.Lambda(euclidean_distance, output_shape=eucl_dist_output_shape, name="Euclidean_Distance")([processed_a, processed_b])
+
+        model = models.Model(inputs=[input_a, input_b], outputs=distance)
+
+        # 3. Ağırlıkları Yükle (.h5 dosyasından)
+        # Not: load_weights, tam model dosyası olsa bile ağırlıkları çekebilir.
+        model.load_weights(model_path)
+        
+        # Derleme (Compile) - Tahmin için şart değil ama iyi pratik
+        model.compile(loss=contrastive_loss, optimizer='adam')
+        
+        print("✅ Model mimarisi oluşturuldu ve ağırlıklar yüklendi.")
         return model
+
     except Exception as e:
-        st.sidebar.error(f"❌ Model yüklenirken hata oluştu: {e}")
+        st.error(f"❌ Model oluşturulurken hata: {e}")
         return None
 
 # Modeli başlat
-model = load_siamese_model()
+model = load_siamese_model_weights()
 
-# --- YARDIMCI FONKSİYONLAR (METODOLOJİNİZE UYGUN) ---
+# ============================================================================
+# 3. SES ÖN İŞLEME (Preprocessing)
+# ============================================================================
 
-def preprocess_audio_pipeline(audio_bytes, target_sr=16000, fixed_length_sec=4):
-    """
-    Metodolojide belirtilen 5 adımlı ön işleme hattı.
-    Ham ses baytlarını alır, işlenmiş numpy dizisi döndürür.
-    """
+def preprocess_audio_pipeline(audio_bytes, target_sr=SR, fixed_length_samples=SR*4): # 4 Saniye
     try:
-        # Byte verisini numpy dizisine çevir
         y, sr = sf.read(io.BytesIO(audio_bytes))
         
-        # 1. Format Standardizasyonu (16kHz, Mono)
+        # 1. Resample & Mono
         if sr != target_sr:
             y = librosa.resample(y=y, orig_sr=sr, target_sr=target_sr)
         if len(y.shape) > 1:
              y = librosa.to_mono(y)
         
-        # 2. Durağan Gürültü Azaltma (Stationary Noise Reduction)
-        # Not: noisereduce bazen çok kısa seslerde sorun çıkarabilir, try-except eklenebilir.
-        y = nr.reduce_noise(y=y, sr=target_sr)
+        # 2. Gürültü Azaltma
+        try:
+            y = nr.reduce_noise(y=y, sr=target_sr)
+        except:
+            pass # Çok kısa seslerde hata verirse geç
 
-        # 3. Sessizlik Silme (Silence Trimming)
+        # 3. Sessizlik Silme
         y, _ = librosa.effects.trim(y, top_db=20)
 
-        # 4. Sabit Uzunluklu Segmentasyon (Fixed-Length Segmentation - 4sn)
-        target_length = int(target_sr * fixed_length_sec) # 64000 örnek
-        if len(y) < target_length:
-            # Zero-padding (Kısa ise sıfır ekle)
-            y = librosa.util.pad_center(y, size=target_length)
+        # 4. Sabit Uzunluk (4 sn / ~64000 samples)
+        # Sizin kodunuzdaki mantık: MFCC boyutunu 128'e denk getirmek.
+        # Burada önce sesi padding yapıyoruz.
+        target_length = int(SR * 4.0) # 64000
+        if len(y) > target_length:
+             y = y[:target_length]
         else:
-            # Truncation (Uzun ise kırp)
-            y = y[:target_length]
+             y = np.pad(y, (0, target_length - len(y)), mode='constant')
             
-        # 5. Normalizasyon (Genlik -1 ile 1 arası)
+        # 5. Normalizasyon
         y = librosa.util.normalize(y)
 
-        return y, target_sr
+        return y
     except Exception as e:
         st.error(f"Ses işleme hatası: {e}")
+        return None
+
+def extract_features_mfcc(y, sr=SR):
+    """
+    Sizin kodunuzdaki extract_mfcc mantığıyla birebir aynı.
+    Çıktı: (1, 40, 128, 1)
+    """
+    try:
+        mfcc = librosa.feature.mfcc(
+            y=y, 
+            sr=sr, 
+            n_mfcc=N_MFCC, 
+            hop_length=HOP_LENGTH
+        )
+        
+        # Boyutlandırma (128 width)
+        if mfcc.shape[1] < MAX_LEN:
+            pad_width = MAX_LEN - mfcc.shape[1]
+            mfcc = np.pad(mfcc, ((0, 0), (0, pad_width)), mode='constant')
+        else:
+            mfcc = mfcc[:, :MAX_LEN]
+            
+        # Model girişi için şekillendirme: (Batch, Height, Width, Channels)
+        mfcc_reshaped = mfcc.reshape(1, N_MFCC, MAX_LEN, 1)
+        return mfcc_reshaped, mfcc
+    except Exception as e:
+        st.error(f"MFCC hatası: {e}")
         return None, None
 
-def extract_features_mfcc(processed_audio, sr=16000):
-    """
-    İşlenmiş sesten MFCC özelliklerini çıkarır ve model girişine uygun şekillendirir.
-    Çıktı Boyutu: (1, 40, 128, 1)
-    """
-    # Metodolojideki parametreler
-    n_mfcc = 40
-    n_fft = 2048
-    hop_length = 512
-    
-    mfcc = librosa.feature.mfcc(y=processed_audio, sr=sr, n_mfcc=n_mfcc, n_fft=n_fft, hop_length=hop_length)
-    
-    # MFCC genellikle (n_mfcc, zaman) şeklindedir.
-    # Eğer 4 saniye ise ve hop_length 512 ise zaman boyutu yaklaşık 126-128 arası çıkar.
-    # CNN girişi için sabit boyuta (örn: 128) emin olmak gerekebilir.
-    # Burada librosa'nın çıktısının tam 128 zaman adımına denk geldiğini varsayıyoruz.
-    # Değilse, burada da bir padding/trimming gerekebilir.
-    
-    # Şekillendirme: (Batch_Size, Height, Width, Channels) -> (1, 40, 128, 1)
-    # Not: Zaman boyutunun 128 olduğundan emin olun, değilse eğitim kodunuza göre ayarlayın.
-    if mfcc.shape[1] != 128:
-        mfcc = librosa.util.fix_length(mfcc, size=128, axis=1)
+# ============================================================================
+# 4. ARAYÜZ (UI)
+# ============================================================================
 
-    mfcc_reshaped = mfcc[np.newaxis, ..., np.newaxis]
-    return mfcc_reshaped, mfcc # Görselleştirme için ham MFCC'yi de döndür
+st.title("🛡️ Sesle Kimlik Doğrulama Sistemi")
+st.markdown("Siyam Ağı (Siamese CNN) kullanılarak geliştirilmiştir.")
 
-def calculate_euclidean_distance(embed1, embed2):
-    """İki gömü vektörü arasındaki Öklid mesafesini hesaplar."""
-    # Embeddings shape: (1, 128)
-    return np.linalg.norm(embed1 - embed2)
-
-def plot_spectrogram(mfcc_data, title):
-    """MFCC görselleştirmesi için yardımcı fonksiyon."""
-    fig, ax = plt.subplots(figsize=(4, 2))
-    img = librosa.display.specshow(mfcc_data, x_axis='time', ax=ax)
-    fig.colorbar(img, ax=ax)
-    ax.set(title=title)
-    return fig
-
-# --- ANA ARAYÜZ ---
+# Yan Menü Ayarları
+st.sidebar.header("Ayarlar")
+THRESHOLD = st.sidebar.slider("Karar Eşik Değeri (Threshold)", 0.0, 1.0, 0.1100, 0.001)
+st.sidebar.info(f"Seçili Eşik: {THRESHOLD}")
 
 col1, col2 = st.columns(2)
 
-# --- SOL KOLON: REFERANS SES (ANCHOR) ---
+# SOL KOLON: REFERANS (ANCHOR)
 with col1:
-    st.header("1. Referans Ses (Anchor)")
-    st.write("Yetkili kullanıcının gerçek sesi.")
+    st.header("1. Referans Ses")
+    anchor_file = st.file_uploader("Yetkili Sesi Yükle", type=["wav", "mp3"], key="anchor")
     
-    anchor_file = st.file_uploader("Referans ses dosyası yükle (.wav)", type=["wav", "mp3"], key="anchor")
-    # Alternatif olarak mikrofondan da alınabilir ama anchor genellikle sabittir.
-    
-    anchor_processed = None
-    anchor_features = None
-    
-    if anchor_file is not None:
-        st.audio(anchor_file, format='audio/wav')
-        with st.spinner('Referans ses işleniyor...'):
-            # Byte verisini al
-            anchor_bytes = anchor_file.getvalue()
-            # Ön işleme
-            anchor_processed, sr = preprocess_audio_pipeline(anchor_bytes)
-            if anchor_processed is not None:
-                # Öznitelik Çıkarımı
-                anchor_features, anchor_mfcc_vis = extract_features_mfcc(anchor_processed, sr)
-                st.success("Referans ses hazırlandı.")
-                with st.expander("Spektrogramı Göster"):
-                     st.pyplot(plot_spectrogram(anchor_mfcc_vis, "Anchor MFCC"))
+    feat_ref = None
+    if anchor_file:
+        st.audio(anchor_file)
+        y_ref = preprocess_audio_pipeline(anchor_file.getvalue())
+        if y_ref is not None:
+            feat_ref, viz_ref = extract_features_mfcc(y_ref)
+            st.success("Referans işlendi.")
 
-# --- SAĞ KOLON: TEST SESİ ---
+# SAĞ KOLON: TEST (INPUT)
 with col2:
     st.header("2. Test Sesi")
-    st.write("Doğrulanacak şüpheli ses (Mikrofon veya Dosya).")
-
-    # Yeni Streamlit özelliği: Ses Girişi (Mikrofon)
-    test_audio_input = st.audio_input("Mikrofon ile Kaydet", key="test_mic")
-    # Veya dosya yükleme
-    test_file_upload = st.file_uploader("Veya test dosyası yükle", type=["wav", "mp3"], key="test_file")
+    # Hem dosya yükleme hem mikrofon seçeneği
+    input_method = st.radio("Giriş Yöntemi:", ["Dosya Yükle", "Mikrofon"])
     
-    test_file = test_audio_input if test_audio_input else test_file_upload
-    
-    test_processed = None
-    test_features = None
-
-    if test_file is not None:
-        st.audio(test_file, format='audio/wav')
-        with st.spinner('Test sesi işleniyor...'):
-             # Byte verisini al
-            test_bytes = test_file.getvalue()
-             # Ön işleme
-            test_processed, sr = preprocess_audio_pipeline(test_bytes)
-            if test_processed is not None:
-                # Öznitelik Çıkarımı
-                test_features, test_mfcc_vis = extract_features_mfcc(test_processed, sr)
-                st.success("Test sesi hazırlandı.")
-                with st.expander("Spektrogramı Göster"):
-                     st.pyplot(plot_spectrogram(test_mfcc_vis, "Test MFCC"))
-
-# --- DOĞRULAMA BÖLÜMÜ ---
-st.markdown("---")
-st.header("3. Doğrulama Sonucu")
-
-verify_button = st.button("🔊 Kimliği Doğrula", type="primary", use_container_width=True)
-
-if verify_button:
-    if model is None:
-        st.error("Model yüklenemediği için doğrulama yapılamıyor.")
-    elif anchor_features is None or test_features is None:
-        st.warning("Lütfen önce hem Referans hem de Test seslerini sağlayın.")
+    test_file = None
+    if input_method == "Dosya Yükle":
+        test_file = st.file_uploader("Şüpheli Sesi Yükle", type=["wav", "mp3"], key="test")
     else:
-        with st.spinner('Siyam Ağı karşılaştırması yapılıyor...'):
-            # NOT: Eğittiğiniz modelin çıktısına göre burası değişebilir.
-            # SENARYO A: Modeliniz direkt mesafeyi (tek bir sayı) döndürüyorsa:
-            # distance = model.predict([anchor_features, test_features])[0][0]
-            
-            # SENARYO B (Daha yaygın): Modeliniz iki ayrı embedding döndürüyorsa (Metodolojinize daha uygun):
-            # Modelin iki çıktısı olduğunu varsayıyoruz: embedding_1, embedding_2
-            embeddings = model.predict([anchor_features, test_features])
-            embedding_anchor = embeddings[0]
-            embedding_test = embeddings[1]
-            
-            # Öklid mesafesini hesapla
-            distance = calculate_euclidean_distance(embedding_anchor, embedding_test)
+        test_file = st.audio_input("Mikrofonla Kaydet")
 
-            # --- SONUÇ EKRANI ---
-            st.metric(label="Hesaplanan Benzerlik Mesafesi (Öklid)", value=f"{distance:.4f}")
+    feat_test = None
+    if test_file:
+        st.audio(test_file)
+        y_test = preprocess_audio_pipeline(test_file.getvalue())
+        if y_test is not None:
+            feat_test, viz_test = extract_features_mfcc(y_test)
+            st.success("Test sesi işlendi.")
+
+# DOĞRULAMA BUTONU
+st.divider()
+if st.button("🔍 KİMLİĞİ DOĞRULA", use_container_width=True, type="primary"):
+    if model is None:
+        st.error("Model yüklenemedi!")
+    elif feat_ref is None or feat_test is None:
+        st.warning("Lütfen her iki sesi de yükleyin.")
+    else:
+        with st.spinner("Siyam ağı karşılaştırıyor..."):
+            # Tahmin
+            distance = model.predict([feat_ref, feat_test], verbose=0)[0][0]
+            
+            st.metric("Hesaplanan Benzerlik Mesafesi", f"{distance:.4f}")
             
             if distance < THRESHOLD:
-                st.success("✅ KİMLİK DOĞRULANDI (Yetkili Kullanıcı)")
+                st.success(f"✅ EŞLEŞME BAŞARILI! (Mesafe {THRESHOLD}'dan küçük)")
                 st.balloons()
             else:
-                st.error("⛔ KİMLİK REDDEDİLDİ (Potansiyel Sahtecilik/Deepfake)")
+                st.error(f"⛔ EŞLEŞME BAŞARISIZ! (Mesafe {THRESHOLD}'dan büyük)")
