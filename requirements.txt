@@ -1,0 +1,8 @@
+streamlit
+tensorflow  # veya keras, modelinize bağlı olarak
+librosa
+numpy
+scipy
+noisereduce
+soundfile
+matplotlib # Spektrogram görselleştirmesi için
